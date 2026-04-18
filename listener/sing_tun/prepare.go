@@ -7,6 +7,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
+	TS "github.com/metacubex/mihomo/component/tailscale"
 	"github.com/metacubex/mihomo/log"
 
 	tun "github.com/metacubex/sing-tun"
@@ -21,6 +22,10 @@ func (h *ListenerHandler) PrepareConnection(network string, source M.Socksaddr, 
 		if h.DisableICMPForwarding || h.skipPingForwardingByAddr(destination.Addr) { // skip if ICMP handling is disabled or other condition
 			log.Infoln("[ICMP] %s %s --> %s using fake ping echo", network, source, destination)
 			return nil, nil
+		}
+		if prefix, ok := TS.LookupRoute(destination.Addr); ok {
+			log.Infoln("[ICMP] %s %s --> %s using TAILSCALE(%s)", network, source, destination, prefix)
+			return newTailscalePingDestination(destination.Addr, routeContext, timeout), nil
 		}
 		log.Infoln("[ICMP] %s %s --> %s using DIRECT", network, source, destination)
 		directRouteDestination, err := ping.ConnectDestination(context.TODO(), log.SingLogger, dialer.ICMPControl(destination.Addr), destination.Addr, routeContext, timeout)
