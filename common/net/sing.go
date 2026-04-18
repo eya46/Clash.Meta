@@ -1,10 +1,15 @@
 package net
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"net"
+	"runtime"
+	"runtime/debug"
 
 	"github.com/metacubex/mihomo/common/net/deadline"
+	"github.com/metacubex/mihomo/log"
 
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/bufio"
@@ -72,22 +77,64 @@ func Relay(leftConn, rightConn net.Conn) {
 		_ = rightConn.Close()
 	}()
 
-	ch := make(chan struct{})
+	ch := make(chan error, 1)
 	go func() {
-		_, err := bufio.Copy(leftConn, rightConn)
+		err := relayCopy(leftConn, rightConn, "left<-right")
 		if err == nil {
 			_ = closeWrite(leftConn)
 		} else {
 			_ = leftConn.Close()
 		}
-		close(ch)
+		ch <- err
 	}()
 
-	_, err := bufio.Copy(rightConn, leftConn)
+	err := relayCopy(rightConn, leftConn, "right<-left")
 	if err == nil {
 		_ = closeWrite(rightConn)
 	} else {
 		_ = rightConn.Close()
 	}
 	<-ch
+}
+
+func relayCopy(dst, src net.Conn, direction string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("relay panic (%s): %v", direction, r)
+			log.Errorln("[RELAY] panic during copy %s: %v\n%s", direction, r, debug.Stack())
+		}
+	}()
+
+	if runtime.GOOS == "windows" {
+		return relayCopySafe(dst, src)
+	}
+
+	_, err = bufio.Copy(dst, src)
+	return err
+}
+
+func relayCopySafe(dst, src net.Conn) error {
+	buffer := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			written := 0
+			for written < n {
+				m, writeErr := dst.Write(buffer[written:n])
+				if writeErr != nil {
+					return writeErr
+				}
+				if m == 0 {
+					return io.ErrShortWrite
+				}
+				written += m
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
 }
