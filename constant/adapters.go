@@ -40,6 +40,7 @@ const (
 	Hysteria
 	Hysteria2
 	WireGuard
+	Tailscale
 	Tuic
 	Ssh
 	Mieru
@@ -205,6 +206,8 @@ func (at AdapterType) String() string {
 		return "Hysteria2"
 	case WireGuard:
 		return "WireGuard"
+	case Tailscale:
+		return "Tailscale"
 	case Tuic:
 		return "Tuic"
 	case Ssh:

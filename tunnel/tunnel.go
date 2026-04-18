@@ -21,6 +21,7 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/slowdown"
 	"github.com/metacubex/mihomo/component/sniffer"
+	TS "github.com/metacubex/mihomo/component/tailscale"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/features"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -306,6 +307,19 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
+func matchTailscaleRoute(metadata *C.Metadata, helper C.RuleMatchHelper) (netip.Prefix, bool) {
+	if prefix, ok := TS.Match(metadata.DstIP); ok {
+		return prefix, true
+	}
+
+	if metadata.Host == "" || metadata.Resolved() || helper.ResolveIP == nil {
+		return netip.Prefix{}, false
+	}
+
+	helper.ResolveIP()
+	return TS.Match(metadata.DstIP)
+}
+
 func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
 	if metadata.SpecialProxy != "" {
 		var exist bool
@@ -385,6 +399,13 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		proxy = proxies["GLOBAL"]
 	// Rule
 	default:
+		if prefix, ok := matchTailscaleRoute(metadata, helper); ok {
+			if tsProxy := TS.Proxy(); tsProxy != nil {
+				proxy = tsProxy
+				rule = TS.RouteRule(prefix)
+				return
+			}
+		}
 		proxy, rule, err = match(metadata, helper)
 	}
 	return
