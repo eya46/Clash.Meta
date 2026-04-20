@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -30,6 +31,15 @@ type Config struct {
 	AuthKey        string
 	ControlURL     string
 	DisabledRoutes []string
+	// RouteControlPlaneViaProxy, when true, lets the Tailscale control-plane
+	// traffic (login/controlplane/log.tailscale.com, user ControlURL) flow
+	// through mihomo's rule chain instead of being forced DIRECT. Defaults
+	// to false: traffic is bypassed to DIRECT so a broken proxy can't stall
+	// tsnet startup.
+	RouteControlPlaneViaProxy bool
+	// RouteDERPViaProxy does the same for DERP relay traffic (official
+	// derp*.tailscale.com hosts and any custom DERP nodes from DERPMap).
+	RouteDERPViaProxy bool
 }
 
 type State struct {
@@ -213,10 +223,16 @@ type manager struct {
 	warmedPeers sync.Map
 
 	// DERP latency cache. Probes run at most once per derpLatencyInterval.
-	derpLatencyMu      sync.Mutex
-	derpLatencyCache   map[int]int64 // regionID -> latency in ms (-1 if failed)
-	derpLatencyLastRun time.Time
+	derpLatencyMu       sync.Mutex
+	derpLatencyCache    map[int]int64 // regionID -> latency in ms (-1 if failed)
+	derpLatencyLastRun  time.Time
 	derpLatencyInFlight bool
+
+	// Infrastructure target sets, atomically swapped on refreshStatus.
+	// Read by the tunnel dispatcher fast path, so kept lock-free.
+	derpHostSet atomic.Pointer[map[string]struct{}]
+	derpIPSet   atomic.Pointer[map[netip.Addr]struct{}]
+	controlHost atomic.Pointer[string] // lowercased host parsed from ControlURL
 }
 
 const tailscaleProxyName = "TAILSCALE"
@@ -343,6 +359,7 @@ func (m *manager) applyConfig(config Config) error {
 	config.ControlURL = strings.TrimSpace(config.ControlURL)
 	disabledRoutes, normalizedDisabledRoutes := parsePrefixes(config.DisabledRoutes)
 	config.DisabledRoutes = normalizedDisabledRoutes
+	m.updateControlHost(config.ControlURL)
 
 	m.mu.Lock()
 	currentEnable := m.config.Enable
@@ -912,6 +929,7 @@ func (m *manager) refreshStatus(session uint64, client localClient) error {
 	if derpErr != nil {
 		log.Infoln("[TAILSCALE] CurrentDERPMap error (non-fatal): %s", derpErr.Error())
 	}
+	m.updateDERPTargets(derpMap)
 
 	tailscaleIPs := make([]string, 0, len(status.TailscaleIPs))
 	for _, addr := range status.TailscaleIPs {
@@ -1474,6 +1492,135 @@ func buildPeerInfo(peer *ipnstate.PeerStatus) PeerInfo {
 		info.ConnectionType = "idle"
 	}
 	return info
+}
+
+// InfraKind classifies a traffic target as Tailscale infrastructure so the
+// dispatcher can decide whether to bypass the proxy rule chain.
+type InfraKind int
+
+const (
+	InfraNone InfraKind = iota
+	InfraControl
+	InfraDERP
+)
+
+// defaultTailscaleSuffix is the DNS suffix used by Tailscale's official
+// control plane, log collector, and DERP relays. Hosts ending in this
+// suffix are always classified as infrastructure even before DERPMap is
+// loaded, so cold-start handshakes can be bypassed.
+const defaultTailscaleSuffix = "tailscale.com"
+
+func (m *manager) updateControlHost(controlURL string) {
+	host := strings.ToLower(strings.TrimSpace(controlURL))
+	if host != "" {
+		if u, err := url.Parse(host); err == nil && u.Host != "" {
+			host = u.Hostname()
+		}
+	}
+	if host == "" {
+		m.controlHost.Store(nil)
+		return
+	}
+	m.controlHost.Store(&host)
+}
+
+func (m *manager) updateDERPTargets(dm *tailcfg.DERPMap) {
+	if dm == nil {
+		return
+	}
+	hosts := make(map[string]struct{})
+	ips := make(map[netip.Addr]struct{})
+	for _, region := range dm.Regions {
+		if region == nil {
+			continue
+		}
+		for _, node := range region.Nodes {
+			if node == nil {
+				continue
+			}
+			if h := strings.ToLower(strings.TrimSpace(node.HostName)); h != "" {
+				hosts[h] = struct{}{}
+			}
+			if node.IPv4 != "" {
+				if addr, err := netip.ParseAddr(node.IPv4); err == nil {
+					ips[addr] = struct{}{}
+				}
+			}
+			if node.IPv6 != "" {
+				if addr, err := netip.ParseAddr(node.IPv6); err == nil {
+					ips[addr] = struct{}{}
+				}
+			}
+		}
+	}
+	m.derpHostSet.Store(&hosts)
+	m.derpIPSet.Store(&ips)
+}
+
+func (m *manager) classifyInfra(host string, addr netip.Addr) InfraKind {
+	host = strings.ToLower(strings.TrimSpace(host))
+
+	if host != "" {
+		if set := m.derpHostSet.Load(); set != nil {
+			if _, ok := (*set)[host]; ok {
+				return InfraDERP
+			}
+		}
+		if customHost := m.controlHost.Load(); customHost != nil && *customHost == host {
+			return InfraControl
+		}
+		if host == defaultTailscaleSuffix || strings.HasSuffix(host, "."+defaultTailscaleSuffix) {
+			// derp1.tailscale.com, derp2b.tailscale.com, etc.
+			// Take the left-most label and check for the "derp" prefix.
+			label := host
+			if idx := strings.IndexByte(label, '.'); idx >= 0 {
+				label = label[:idx]
+			}
+			if strings.HasPrefix(label, "derp") {
+				return InfraDERP
+			}
+			return InfraControl
+		}
+	}
+
+	if addr.IsValid() {
+		if set := m.derpIPSet.Load(); set != nil {
+			if _, ok := (*set)[addr]; ok {
+				return InfraDERP
+			}
+		}
+	}
+
+	return InfraNone
+}
+
+// ShouldBypass reports whether traffic to the given metadata should be
+// forced DIRECT, skipping rule matching. It only returns true when the
+// target is Tailscale infrastructure AND the corresponding bypass toggle
+// is enabled in the current config.
+func (m *manager) ShouldBypass(host string, addr netip.Addr) bool {
+	kind := m.classifyInfra(host, addr)
+	if kind == InfraNone {
+		return false
+	}
+	m.mu.RLock()
+	cfg := m.config
+	m.mu.RUnlock()
+	if !cfg.Enable {
+		return false
+	}
+	switch kind {
+	case InfraControl:
+		return !cfg.RouteControlPlaneViaProxy
+	case InfraDERP:
+		return !cfg.RouteDERPViaProxy
+	}
+	return false
+}
+
+// ShouldBypass is the package-level wrapper used by the tunnel dispatcher.
+func ShouldBypass(host string, addr netip.Addr) bool {
+	return defaultManager.ShouldBypass(host, addr)
 }
 
 // buildDERPInfos turns a DERPMap into the UI-facing slice, flagging the

@@ -329,6 +329,14 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		}
 		return
 	}
+	// Force DIRECT for Tailscale control-plane / DERP traffic when the
+	// corresponding bypass toggle is enabled. Keeps tsnet's own outbound
+	// connections off the user's proxy, which would otherwise stall tsnet
+	// if the selected node is slow or broken.
+	if TS.ShouldBypass(metadata.Host, metadata.DstIP) {
+		proxy = proxies["DIRECT"]
+		return
+	}
 	var (
 		resolved             bool
 		attemptProcessLookup = metadata.Type != C.INNER
