@@ -157,6 +157,10 @@ type manager struct {
 	// Track active dials for reentrancy protection (with timeout)
 	activeDials sync.Map // map[uint64]time.Time
 	nextDialID  uint64
+
+	// Peers whose WireGuard handshake we've already kicked off, keyed by
+	// "<session>-<addr>" so the entries naturally age out across sessions.
+	warmedPeers sync.Map
 }
 
 const tailscaleProxyName = "TAILSCALE"
@@ -181,7 +185,8 @@ var (
 	tailscaleWatchRetryMax     = 3
 	tailscaleWatchRetryBackoff = 5 * time.Second
 	tailscaleWatchRetryCap     = 60 * time.Second
-	tailscaleDialTimeout       = 10 * time.Second
+	tailscaleDialTimeout       = 30 * time.Second
+	tailscalePeerWarmTimeout   = 15 * time.Second
 )
 
 func summarizeConfig(config Config) string {
@@ -935,6 +940,10 @@ func (m *manager) refreshStatus(session uint64, client localClient) error {
 		peerCount,
 		onlinePeerCount,
 	)
+
+	if backendState == ipn.Running.String() {
+		m.warmPeers(session, status, client)
+	}
 	return nil
 }
 
@@ -1105,6 +1114,66 @@ func (m *manager) ping(
 		return result, errors.New(result.Err)
 	}
 	return result, nil
+}
+
+// warmPeers kicks off a background Ping to each online peer so the
+// WireGuard handshake happens before user traffic hits server.Dial.
+// Subsequent dials can then reuse the session and avoid the 2–10s
+// DERP-mediated handshake delay that otherwise shows up on the user's
+// first request to each peer.
+func (m *manager) warmPeers(
+	session uint64,
+	status *ipnstate.Status,
+	client localClient,
+) {
+	if status == nil || client == nil {
+		return
+	}
+	for _, peer := range status.Peer {
+		if peer == nil || !peer.Online {
+			continue
+		}
+		// Skip peers that were recently handshaken — nothing to warm.
+		if !peer.LastHandshake.IsZero() && time.Since(peer.LastHandshake) < time.Minute {
+			continue
+		}
+		for _, addr := range peer.TailscaleIPs {
+			if !addr.IsValid() {
+				continue
+			}
+			key := fmt.Sprintf("%d-%s", session, addr.String())
+			if _, loaded := m.warmedPeers.LoadOrStore(key, struct{}{}); loaded {
+				continue
+			}
+			go m.warmOnePeer(session, addr, client, key)
+		}
+	}
+}
+
+func (m *manager) warmOnePeer(
+	session uint64,
+	addr netip.Addr,
+	client localClient,
+	key string,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warnln("[TAILSCALE] warm peer panic: session=%d addr=%s err=%v", session, addr, r)
+			m.warmedPeers.Delete(key)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), tailscalePeerWarmTimeout)
+	defer cancel()
+	startedAt := time.Now()
+	_, err := client.Ping(ctx, addr, tailcfg.PingDisco)
+	elapsed := time.Since(startedAt).Round(time.Millisecond)
+	if err != nil {
+		log.Infoln("[TAILSCALE] peer warm failed: session=%d addr=%s elapsed=%s err=%s", session, addr, elapsed, err.Error())
+		// Failed: drop the marker so next refreshStatus retries.
+		m.warmedPeers.Delete(key)
+		return
+	}
+	log.Infoln("[TAILSCALE] peer warmed: session=%d addr=%s elapsed=%s", session, addr, elapsed)
 }
 
 func collectRoutes(status *ipnstate.Status) []netip.Prefix {
