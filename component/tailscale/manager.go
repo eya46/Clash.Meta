@@ -33,19 +33,64 @@ type Config struct {
 }
 
 type State struct {
-	Enable          bool     `json:"enable"`
-	AcceptRoutes    bool     `json:"accept-routes"`
-	BackendState    string   `json:"backend-state"`
-	AuthURL         string   `json:"auth-url"`
-	TailscaleIPs    []string `json:"tailscale-ips"`
-	Routes          []string `json:"routes"`
-	DisabledRoutes  []string `json:"disabled-routes"`
-	Tailnet         string   `json:"tailnet"`
-	MagicDNSSuffix  string   `json:"magic-dns-suffix"`
-	Error           string   `json:"error"`
-	PeerCount       int      `json:"peer-count"`
-	OnlinePeerCount int      `json:"online-peer-count"`
-	LastHandshake   string   `json:"last-handshake"`
+	Enable          bool             `json:"enable"`
+	AcceptRoutes    bool             `json:"accept-routes"`
+	BackendState    string           `json:"backend-state"`
+	AuthURL         string           `json:"auth-url"`
+	TailscaleIPs    []string         `json:"tailscale-ips"`
+	Routes          []string         `json:"routes"`
+	DisabledRoutes  []string         `json:"disabled-routes"`
+	Tailnet         string           `json:"tailnet"`
+	MagicDNSSuffix  string           `json:"magic-dns-suffix"`
+	Error           string           `json:"error"`
+	PeerCount       int              `json:"peer-count"`
+	OnlinePeerCount int              `json:"online-peer-count"`
+	LastHandshake   string           `json:"last-handshake"`
+	Peers           []PeerInfo       `json:"peers"`
+	DERP            []DERPRegionInfo `json:"derp"`
+}
+
+// DERPRegionInfo describes a DERP region known to the local node.
+// "Preferred" is the region self is currently homed on; "InUse" means at
+// least one peer is currently relaying through it. LatencyMs is the last
+// probe result (-1 if not probed yet or the probe failed).
+type DERPRegionInfo struct {
+	RegionID   int      `json:"region-id"`
+	RegionCode string   `json:"region-code"`
+	RegionName string   `json:"region-name"`
+	Nodes      []string `json:"nodes"`
+	Avoid      bool     `json:"avoid"`
+	Custom     bool     `json:"custom"`
+	Preferred  bool     `json:"preferred"`
+	InUse      bool     `json:"in-use"`
+	LatencyMs  int64    `json:"latency-ms"`
+}
+
+// PeerInfo captures the subset of ipnstate.PeerStatus that the UI needs to
+// explain how traffic to a given peer (or subnet behind it) is routed.
+type PeerInfo struct {
+	HostName       string   `json:"host-name"`
+	DNSName        string   `json:"dns-name"`
+	TailscaleIPs   []string `json:"tailscale-ips"`
+	PrimaryRoutes  []string `json:"primary-routes"`
+	Online         bool     `json:"online"`
+	Active         bool     `json:"active"`
+	ExitNode       bool     `json:"exit-node"`
+	ExitNodeOption bool     `json:"exit-node-option"`
+	// ConnectionType is one of "direct", "derp", "idle", "offline".
+	// "direct" means a WireGuard P2P path is currently in use (CurAddr set).
+	// "derp" means traffic is relayed via the listed DERP region.
+	// "idle" means the peer is online but no path has been selected yet
+	//   (first packet will trigger discovery).
+	// "offline" means the peer is reported offline by the coordination server.
+	ConnectionType string `json:"connection-type"`
+	// CurAddr is the current direct UDP endpoint when ConnectionType == "direct".
+	CurAddr string `json:"cur-addr"`
+	// Relay is the short DERP region code (e.g. "sfo") when ConnectionType == "derp".
+	Relay         string `json:"relay"`
+	LastHandshake string `json:"last-handshake"`
+	RxBytes       int64  `json:"rx-bytes"`
+	TxBytes       int64  `json:"tx-bytes"`
 }
 
 type routeRule struct {
@@ -82,6 +127,7 @@ type localClient interface {
 	Status(ctx context.Context) (*ipnstate.Status, error)
 	WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (ipnBusWatcher, error)
 	Ping(ctx context.Context, ip netip.Addr, pingtype tailcfg.PingType) (*ipnstate.PingResult, error)
+	CurrentDERPMap(ctx context.Context) (*tailcfg.DERPMap, error)
 }
 
 type tsnetServer interface {
@@ -109,6 +155,10 @@ func (c *localClientAdapter) WatchIPNBus(ctx context.Context, mask ipn.NotifyWat
 
 func (c *localClientAdapter) Ping(ctx context.Context, ip netip.Addr, pingtype tailcfg.PingType) (*ipnstate.PingResult, error) {
 	return c.client.Ping(ctx, ip, pingtype)
+}
+
+func (c *localClientAdapter) CurrentDERPMap(ctx context.Context) (*tailcfg.DERPMap, error) {
+	return c.client.CurrentDERPMap(ctx)
 }
 
 type tsnetServerAdapter struct {
@@ -161,6 +211,12 @@ type manager struct {
 	// Peers whose WireGuard handshake we've already kicked off, keyed by
 	// "<session>-<addr>" so the entries naturally age out across sessions.
 	warmedPeers sync.Map
+
+	// DERP latency cache. Probes run at most once per derpLatencyInterval.
+	derpLatencyMu      sync.Mutex
+	derpLatencyCache   map[int]int64 // regionID -> latency in ms (-1 if failed)
+	derpLatencyLastRun time.Time
+	derpLatencyInFlight bool
 }
 
 const tailscaleProxyName = "TAILSCALE"
@@ -187,6 +243,8 @@ var (
 	tailscaleWatchRetryCap     = 60 * time.Second
 	tailscaleDialTimeout       = 30 * time.Second
 	tailscalePeerWarmTimeout   = 15 * time.Second
+	tailscaleDERPProbeTimeout  = 3 * time.Second
+	tailscaleDERPProbeInterval = 60 * time.Second
 )
 
 func summarizeConfig(config Config) string {
@@ -850,6 +908,11 @@ func (m *manager) refreshStatus(session uint64, client localClient) error {
 		routeStrings = append(routeStrings, route.String())
 	}
 
+	derpMap, derpErr := client.CurrentDERPMap(ctx)
+	if derpErr != nil {
+		log.Infoln("[TAILSCALE] CurrentDERPMap error (non-fatal): %s", derpErr.Error())
+	}
+
 	tailscaleIPs := make([]string, 0, len(status.TailscaleIPs))
 	for _, addr := range status.TailscaleIPs {
 		tailscaleIPs = append(tailscaleIPs, addr.String())
@@ -867,17 +930,30 @@ func (m *manager) refreshStatus(session uint64, client localClient) error {
 	peerCount := 0
 	onlinePeerCount := 0
 	var latestHandshake time.Time
-	for _, peer := range status.Peer {
+	peerInfos := make([]PeerInfo, 0, len(status.Peer))
+	relaysInUse := map[string]struct{}{}
+	for _, key := range status.Peers() {
+		peer := status.Peer[key]
 		if peer == nil {
 			continue
 		}
 		peerCount++
 		if peer.Online {
 			onlinePeerCount++
+			// Count a DERP as in-use only when the peer currently has no direct
+			// path — that is the case where traffic is actually being relayed.
+			if strings.TrimSpace(peer.CurAddr) == "" && strings.TrimSpace(peer.Relay) != "" {
+				relaysInUse[peer.Relay] = struct{}{}
+			}
 		}
 		if !peer.LastHandshake.IsZero() && peer.LastHandshake.After(latestHandshake) {
 			latestHandshake = peer.LastHandshake
 		}
+		peerInfos = append(peerInfos, buildPeerInfo(peer))
+	}
+	selfRelay := ""
+	if status.Self != nil {
+		selfRelay = status.Self.Relay
 	}
 
 	lastHandshakeStr := ""
@@ -910,6 +986,7 @@ func (m *manager) refreshStatus(session uint64, client localClient) error {
 		backendState = ipn.Starting.String()
 		log.Infoln("[TAILSCALE] preventing NoState from overwriting Starting")
 	}
+	derpInfos := m.buildDERPInfos(derpMap, selfRelay, relaysInUse)
 	m.state = State{
 		Enable:          config.Enable,
 		AcceptRoutes:    config.AcceptRoutes,
@@ -924,6 +1001,8 @@ func (m *manager) refreshStatus(session uint64, client localClient) error {
 		PeerCount:       peerCount,
 		OnlinePeerCount: onlinePeerCount,
 		LastHandshake:   lastHandshakeStr,
+		Peers:           peerInfos,
+		DERP:            derpInfos,
 	}
 	m.mu.Unlock()
 
@@ -943,6 +1022,7 @@ func (m *manager) refreshStatus(session uint64, client localClient) error {
 
 	if backendState == ipn.Running.String() {
 		m.warmPeers(session, status, client)
+		m.maybeProbeDERPLatencies(derpMap)
 	}
 	return nil
 }
@@ -1346,6 +1426,217 @@ func buildRouteLog(
 	}
 
 	return strings.Join(lines, " | ")
+}
+
+func buildPeerInfo(peer *ipnstate.PeerStatus) PeerInfo {
+	info := PeerInfo{
+		HostName:       peer.HostName,
+		DNSName:        strings.TrimSuffix(peer.DNSName, "."),
+		Online:         peer.Online,
+		Active:         peer.Active,
+		ExitNode:       peer.ExitNode,
+		ExitNodeOption: peer.ExitNodeOption,
+		CurAddr:        peer.CurAddr,
+		Relay:          peer.Relay,
+		RxBytes:        peer.RxBytes,
+		TxBytes:        peer.TxBytes,
+	}
+	if len(peer.TailscaleIPs) > 0 {
+		ips := make([]string, 0, len(peer.TailscaleIPs))
+		for _, addr := range peer.TailscaleIPs {
+			ips = append(ips, addr.String())
+		}
+		info.TailscaleIPs = ips
+	}
+	if primary := slicePrefixes(peer.PrimaryRoutes); len(primary) > 0 {
+		routes := make([]string, 0, len(primary))
+		for _, prefix := range primary {
+			if isDefaultRoute(prefix) {
+				continue
+			}
+			routes = append(routes, prefix.String())
+		}
+		if len(routes) > 0 {
+			info.PrimaryRoutes = routes
+		}
+	}
+	if !peer.LastHandshake.IsZero() {
+		info.LastHandshake = peer.LastHandshake.UTC().Format(time.RFC3339)
+	}
+	switch {
+	case !peer.Online:
+		info.ConnectionType = "offline"
+	case strings.TrimSpace(peer.CurAddr) != "":
+		info.ConnectionType = "direct"
+	case strings.TrimSpace(peer.Relay) != "":
+		info.ConnectionType = "derp"
+	default:
+		info.ConnectionType = "idle"
+	}
+	return info
+}
+
+// buildDERPInfos turns a DERPMap into the UI-facing slice, flagging the
+// region self is homed on (preferred) and the regions any peer is currently
+// relaying through (in-use). Latencies are pulled from the probe cache.
+func (m *manager) buildDERPInfos(
+	derpMap *tailcfg.DERPMap,
+	selfRelay string,
+	relaysInUse map[string]struct{},
+) []DERPRegionInfo {
+	if derpMap == nil || len(derpMap.Regions) == 0 {
+		return nil
+	}
+	m.derpLatencyMu.Lock()
+	cache := m.derpLatencyCache
+	m.derpLatencyMu.Unlock()
+
+	regionIDs := make([]int, 0, len(derpMap.Regions))
+	for id := range derpMap.Regions {
+		regionIDs = append(regionIDs, id)
+	}
+	slices.Sort(regionIDs)
+
+	infos := make([]DERPRegionInfo, 0, len(regionIDs))
+	for _, id := range regionIDs {
+		region := derpMap.Regions[id]
+		if region == nil {
+			continue
+		}
+		nodes := make([]string, 0, len(region.Nodes))
+		custom := false
+		for _, node := range region.Nodes {
+			if node == nil {
+				continue
+			}
+			nodes = append(nodes, node.HostName)
+			if !strings.HasSuffix(strings.ToLower(node.HostName), ".tailscale.com") {
+				custom = true
+			}
+		}
+		// Regions at/above 900 are reserved for custom DERP maps in Tailscale's
+		// convention; treat them as custom even if a node hostname happens to
+		// end in tailscale.com.
+		if id >= 900 {
+			custom = true
+		}
+		latency := int64(-1)
+		if v, ok := cache[id]; ok {
+			latency = v
+		}
+		_, inUse := relaysInUse[region.RegionCode]
+		infos = append(infos, DERPRegionInfo{
+			RegionID:   id,
+			RegionCode: region.RegionCode,
+			RegionName: region.RegionName,
+			Nodes:      nodes,
+			Avoid:      region.Avoid,
+			Custom:     custom,
+			Preferred:  region.RegionCode == selfRelay && selfRelay != "",
+			InUse:      inUse,
+			LatencyMs:  latency,
+		})
+	}
+	return infos
+}
+
+// maybeProbeDERPLatencies kicks off a background TCP probe against each
+// DERP region, at most once per tailscaleDERPProbeInterval. The result
+// populates derpLatencyCache and is read on the next refreshStatus.
+func (m *manager) maybeProbeDERPLatencies(derpMap *tailcfg.DERPMap) {
+	if derpMap == nil || len(derpMap.Regions) == 0 {
+		return
+	}
+	m.derpLatencyMu.Lock()
+	if m.derpLatencyInFlight {
+		m.derpLatencyMu.Unlock()
+		return
+	}
+	if !m.derpLatencyLastRun.IsZero() &&
+		time.Since(m.derpLatencyLastRun) < tailscaleDERPProbeInterval {
+		m.derpLatencyMu.Unlock()
+		return
+	}
+	m.derpLatencyInFlight = true
+	m.derpLatencyMu.Unlock()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warnln("[TAILSCALE] DERP probe panic: %v", r)
+			}
+			m.derpLatencyMu.Lock()
+			m.derpLatencyInFlight = false
+			m.derpLatencyLastRun = time.Now()
+			m.derpLatencyMu.Unlock()
+		}()
+
+		type result struct {
+			id   int
+			ms   int64
+		}
+		ch := make(chan result, len(derpMap.Regions))
+		var wg sync.WaitGroup
+		for id, region := range derpMap.Regions {
+			if region == nil {
+				continue
+			}
+			wg.Add(1)
+			go func(id int, region *tailcfg.DERPRegion) {
+				defer wg.Done()
+				ch <- result{id: id, ms: probeDERPRegion(region)}
+			}(id, region)
+		}
+		wg.Wait()
+		close(ch)
+
+		next := make(map[int]int64, len(derpMap.Regions))
+		for r := range ch {
+			next[r.id] = r.ms
+		}
+		m.derpLatencyMu.Lock()
+		m.derpLatencyCache = next
+		m.derpLatencyMu.Unlock()
+	}()
+}
+
+// probeDERPRegion returns a rough RTT in ms by TCP-dialing the first
+// non-STUN-only node of the region on its DERP port. It is a coarse
+// liveness / reachability signal — not a true UDP STUN RTT — and returns
+// -1 when no node is reachable.
+func probeDERPRegion(region *tailcfg.DERPRegion) int64 {
+	if region == nil {
+		return -1
+	}
+	for _, node := range region.Nodes {
+		if node == nil || node.STUNOnly {
+			continue
+		}
+		host := node.HostName
+		if host == "" {
+			if node.IPv4 != "" {
+				host = node.IPv4
+			} else if node.IPv6 != "" {
+				host = node.IPv6
+			}
+		}
+		if host == "" {
+			continue
+		}
+		port := node.DERPPort
+		if port == 0 {
+			port = 443
+		}
+		addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", addr, tailscaleDERPProbeTimeout)
+		if err != nil {
+			continue
+		}
+		_ = conn.Close()
+		return time.Since(start).Milliseconds()
+	}
+	return -1
 }
 
 func peerDisplayName(peer *ipnstate.PeerStatus) string {

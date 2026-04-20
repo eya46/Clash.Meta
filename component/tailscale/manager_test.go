@@ -58,10 +58,11 @@ func (s *fakeServer) Dial(ctx context.Context, network, address string) (net.Con
 }
 
 type fakeClient struct {
-	editPrefsFn   func(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error)
-	statusFn      func(ctx context.Context) (*ipnstate.Status, error)
-	watchIPNBusFn func(ctx context.Context, mask ipn.NotifyWatchOpt) (ipnBusWatcher, error)
-	pingFn        func(ctx context.Context, ip netip.Addr, pingtype tailcfg.PingType) (*ipnstate.PingResult, error)
+	editPrefsFn      func(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error)
+	statusFn         func(ctx context.Context) (*ipnstate.Status, error)
+	watchIPNBusFn    func(ctx context.Context, mask ipn.NotifyWatchOpt) (ipnBusWatcher, error)
+	pingFn           func(ctx context.Context, ip netip.Addr, pingtype tailcfg.PingType) (*ipnstate.PingResult, error)
+	currentDERPMapFn func(ctx context.Context) (*tailcfg.DERPMap, error)
 }
 
 func (c *fakeClient) EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error) {
@@ -95,6 +96,13 @@ func (c *fakeClient) Ping(ctx context.Context, ip netip.Addr, pingtype tailcfg.P
 		return c.pingFn(ctx, ip, pingtype)
 	}
 	return &ipnstate.PingResult{}, nil
+}
+
+func (c *fakeClient) CurrentDERPMap(ctx context.Context) (*tailcfg.DERPMap, error) {
+	if c.currentDERPMapFn != nil {
+		return c.currentDERPMapFn(ctx)
+	}
+	return nil, nil
 }
 
 type fakeWatcher struct {
