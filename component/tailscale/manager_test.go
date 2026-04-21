@@ -17,6 +17,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 )
 
 type fakeServer struct {
@@ -822,6 +823,66 @@ func BenchmarkMatch(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		m.match(addr, false)
 	}
+}
+
+func TestPeerRoutesIncludesPeerTailscaleIPs(t *testing.T) {
+	peer := &ipnstate.PeerStatus{
+		TailscaleIPs: []netip.Addr{
+			netip.MustParseAddr("100.64.0.5"),
+			netip.MustParseAddr("fd7a:115c:a1e0::5"),
+		},
+		AllowedIPs: ptrSliceView([]netip.Prefix{
+			netip.MustParsePrefix("100.64.0.5/32"),
+			netip.MustParsePrefix("fd7a:115c:a1e0::5/128"),
+			netip.MustParsePrefix("192.168.1.0/24"),
+		}),
+	}
+
+	routes := peerRoutes(peer)
+	if !containsPrefix(routes, netip.MustParsePrefix("100.64.0.5/32")) {
+		t.Fatalf("expected peer /32 in routes, got %v", routes)
+	}
+	if !containsPrefix(routes, netip.MustParsePrefix("fd7a:115c:a1e0::5/128")) {
+		t.Fatalf("expected peer /128 in routes, got %v", routes)
+	}
+	if !containsPrefix(routes, netip.MustParsePrefix("192.168.1.0/24")) {
+		t.Fatalf("expected subnet route in routes, got %v", routes)
+	}
+}
+
+func TestPeerRoutesPreservesTailscaleIPsWithPrimaryRoutes(t *testing.T) {
+	peer := &ipnstate.PeerStatus{
+		TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.7")},
+		PrimaryRoutes: ptrSliceView([]netip.Prefix{
+			netip.MustParsePrefix("10.1.0.0/16"),
+		}),
+		AllowedIPs: ptrSliceView([]netip.Prefix{
+			netip.MustParsePrefix("100.64.0.7/32"),
+			netip.MustParsePrefix("10.1.0.0/16"),
+		}),
+	}
+
+	routes := peerRoutes(peer)
+	if !containsPrefix(routes, netip.MustParsePrefix("100.64.0.7/32")) {
+		t.Fatalf("expected peer /32 to be present when PrimaryRoutes is set, got %v", routes)
+	}
+	if !containsPrefix(routes, netip.MustParsePrefix("10.1.0.0/16")) {
+		t.Fatalf("expected PrimaryRoute to be present, got %v", routes)
+	}
+}
+
+func ptrSliceView(prefixes []netip.Prefix) *views.Slice[netip.Prefix] {
+	v := views.SliceOf(prefixes)
+	return &v
+}
+
+func containsPrefix(haystack []netip.Prefix, needle netip.Prefix) bool {
+	for _, p := range haystack {
+		if p == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func TestMain(m *testing.M) {

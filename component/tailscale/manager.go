@@ -1310,25 +1310,42 @@ func collectRoutes(status *ipnstate.Status) []netip.Prefix {
 }
 
 func peerRoutes(peer *ipnstate.PeerStatus) []netip.Prefix {
-	if peer.PrimaryRoutes != nil && !peer.PrimaryRoutes.IsNil() {
-		return append([]netip.Prefix(nil), peer.PrimaryRoutes.AsSlice()...)
-	}
-
-	if peer.AllowedIPs == nil || peer.AllowedIPs.IsNil() {
-		return nil
-	}
-
-	tailscaleIPs := map[netip.Addr]struct{}{}
-	for _, addr := range peer.TailscaleIPs {
-		tailscaleIPs[addr] = struct{}{}
-	}
-
+	seen := map[netip.Prefix]struct{}{}
 	var routes []netip.Prefix
-	for _, prefix := range peer.AllowedIPs.AsSlice() {
-		if _, ok := tailscaleIPs[prefix.Addr()]; ok && prefix.Bits() == prefix.Addr().BitLen() {
+	add := func(prefix netip.Prefix) {
+		if !prefix.IsValid() {
+			return
+		}
+		if _, ok := seen[prefix]; ok {
+			return
+		}
+		seen[prefix] = struct{}{}
+		routes = append(routes, prefix)
+	}
+
+	// Always route the peer's own Tailscale IPs through tsnet. mihomo has no
+	// tailscale TUN of its own, so the /32 (or /128) per-peer prefixes must
+	// be in the route table for direct peer-to-peer connections to match.
+	// Otherwise traffic to 100.64.x.x falls through to the regular rule
+	// chain (usually DIRECT) and is black-holed at the real internet.
+	for _, addr := range peer.TailscaleIPs {
+		if !addr.IsValid() {
 			continue
 		}
-		routes = append(routes, prefix)
+		add(netip.PrefixFrom(addr, addr.BitLen()))
+	}
+
+	if peer.PrimaryRoutes != nil && !peer.PrimaryRoutes.IsNil() {
+		for _, prefix := range peer.PrimaryRoutes.AsSlice() {
+			add(prefix)
+		}
+		return routes
+	}
+
+	if peer.AllowedIPs != nil && !peer.AllowedIPs.IsNil() {
+		for _, prefix := range peer.AllowedIPs.AsSlice() {
+			add(prefix)
+		}
 	}
 	return routes
 }
