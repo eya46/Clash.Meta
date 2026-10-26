@@ -477,3 +477,10 @@ func (t *Tailscale) Close() error {
 	}
 	return nil
 }
+
+// Server exposes the tsnet instance so an embedding host can drive the same
+// node the outbound dials through: read status, walk peers, watch the DERP
+// state. It returns nil until start has begun.
+func (t *Tailscale) Server() *tsnet.Server {
+	return t.server
+}
