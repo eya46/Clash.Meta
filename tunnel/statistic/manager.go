@@ -26,21 +26,21 @@ func init() {
 }
 
 type Manager struct {
-	connections   xsync.Map[string, Tracker]
-	uploadTemp    atomic.Int64
-	downloadTemp  atomic.Int64
-	uploadBlip    atomic.Int64
-	downloadBlip  atomic.Int64
-	uploadTotal   atomic.Int64
-	downloadTotal atomic.Int64
+	connections        xsync.Map[string, Tracker]
+	uploadTemp         atomic.Int64
+	downloadTemp       atomic.Int64
+	uploadBlip         atomic.Int64
+	downloadBlip       atomic.Int64
+	uploadTotal        atomic.Int64
+	downloadTotal      atomic.Int64
 	proxyUploadTemp    atomic.Int64
 	proxyDownloadTemp  atomic.Int64
 	proxyUploadBlip    atomic.Int64
 	proxyDownloadBlip  atomic.Int64
 	proxyUploadTotal   atomic.Int64
 	proxyDownloadTotal atomic.Int64
-	pid           int32
-	memory        uint64
+	pid                int32
+	memory             uint64
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -67,8 +67,8 @@ func (m *Manager) Range(f func(c Tracker) bool) {
 	})
 }
 
-func (m *Manager) PushUploaded(lastChain string, size int64) {
-	if lastChain != "DIRECT" {
+func (m *Manager) PushUploaded(direct bool, size int64) {
+	if !direct {
 		m.proxyUploadTemp.Add(size)
 		m.proxyUploadTotal.Add(size)
 	}
@@ -76,8 +76,8 @@ func (m *Manager) PushUploaded(lastChain string, size int64) {
 	m.uploadTotal.Add(size)
 }
 
-func (m *Manager) PushDownloaded(lastChain string, size int64) {
-	if lastChain != "DIRECT" {
+func (m *Manager) PushDownloaded(direct bool, size int64) {
+	if !direct {
 		m.proxyDownloadTemp.Add(size)
 		m.proxyDownloadTotal.Add(size)
 	}
