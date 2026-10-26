@@ -1,23 +1,26 @@
 package sudoku
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"strings"
 
 	"github.com/metacubex/mihomo/transport/sudoku/multiplex"
+	"github.com/metacubex/mihomo/transport/sudoku/obfs/httpmask"
 )
 
 // StartMultiplexClient upgrades an already-handshaked Sudoku tunnel into a multiplex session.
-func StartMultiplexClient(conn net.Conn) (*MultiplexClient, error) {
+func StartMultiplexClient(ctx context.Context, conn net.Conn) (*MultiplexClient, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("nil conn")
 	}
 
 	if err := WriteKIPMessage(conn, KIPTypeStartMux, nil); err != nil {
 		return nil, fmt.Errorf("write mux start failed: %w", err)
+	}
+	if err := httpmask.WaitTunnelReady(ctx, conn); err != nil {
+		return nil, fmt.Errorf("warm mux tunnel failed: %w", err)
 	}
 
 	sess, err := multiplex.NewClientSession(conn)
@@ -71,6 +74,15 @@ func (c *MultiplexClient) IsClosed() bool {
 	return c.sess.IsClosed()
 }
 
+func (c *MultiplexClient) Done() <-chan struct{} {
+	if c == nil || c.sess == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return c.sess.Done()
+}
+
 // AcceptMultiplexServer upgrades a server-side, already-handshaked Sudoku connection into a multiplex session.
 func AcceptMultiplexServer(conn net.Conn) (*MultiplexServer, error) {
 	if conn == nil {
@@ -106,7 +118,7 @@ func (s *MultiplexServer) AcceptTCP() (net.Conn, string, error) {
 		return nil, "", err
 	}
 
-	target, err := DecodeAddress(bytes.NewReader(payload))
+	target, err := DecodeAddress(payload)
 	if err != nil {
 		_ = stream.Close()
 		return nil, "", err

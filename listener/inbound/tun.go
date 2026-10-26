@@ -14,6 +14,7 @@ type TunOption struct {
 	BaseOption
 	Device              string     `inbound:"device,omitempty"`
 	Stack               C.TUNStack `inbound:"stack,omitempty"`
+	DNSMode             string     `inbound:"dns-mode,omitempty"`
 	DNSHijack           []string   `inbound:"dns-hijack,omitempty"`
 	AutoRoute           bool       `inbound:"auto-route,omitempty"`
 	AutoDetectInterface bool       `inbound:"auto-detect-interface,omitempty"`
@@ -52,7 +53,9 @@ type TunOption struct {
 	ExcludeMACAddress                     []string       `inbound:"exclude-mac-address,omitempty"`
 	EndpointIndependentNat                bool           `inbound:"endpoint-independent-nat,omitempty"`
 	UDPTimeout                            int64          `inbound:"udp-timeout,omitempty"`
+	ICMPTimeout                           int64          `inbound:"icmp-timeout,omitempty"`
 	DisableICMPForwarding                 bool           `inbound:"disable-icmp-forwarding,omitempty"`
+	CongestionController                  string         `inbound:"congestion-controller,omitempty"`
 	FileDescriptor                        int            `inbound:"file-descriptor,omitempty"`
 
 	Inet4RouteAddress        []netip.Prefix `inbound:"inet4-route-address,omitempty"`
@@ -63,6 +66,9 @@ type TunOption struct {
 	// darwin special config
 	RecvMsgX bool `inbound:"recvmsgx,omitempty"`
 	SendMsgX bool `inbound:"sendmsgx,omitempty"`
+
+	// gvisor special config (Non-public option; do not include it in the document.)
+	ProcessorsPerChannel int `inbound:"processors-per-channel,omitempty"`
 }
 
 var _ encoding.TextUnmarshaler = (*netip.Addr)(nil)   // ensure netip.Addr can decode direct by structure package
@@ -92,6 +98,7 @@ func NewTun(options *TunOption) (*Tun, error) {
 			Enable:                                true,
 			Device:                                options.Device,
 			Stack:                                 options.Stack,
+			DNSMode:                               options.DNSMode,
 			DNSHijack:                             options.DNSHijack,
 			AutoRoute:                             options.AutoRoute,
 			AutoDetectInterface:                   options.AutoDetectInterface,
@@ -129,7 +136,9 @@ func NewTun(options *TunOption) (*Tun, error) {
 			ExcludeMACAddress:                     options.ExcludeMACAddress,
 			EndpointIndependentNat:                options.EndpointIndependentNat,
 			UDPTimeout:                            options.UDPTimeout,
+			ICMPTimeout:                           options.ICMPTimeout,
 			DisableICMPForwarding:                 options.DisableICMPForwarding,
+			CongestionController:                  options.CongestionController,
 			FileDescriptor:                        options.FileDescriptor,
 
 			Inet4RouteAddress:        options.Inet4RouteAddress,
@@ -139,6 +148,8 @@ func NewTun(options *TunOption) (*Tun, error) {
 
 			RecvMsgX: options.RecvMsgX,
 			SendMsgX: options.SendMsgX,
+
+			ProcessorsPerChannel: options.ProcessorsPerChannel,
 		},
 	}, nil
 }

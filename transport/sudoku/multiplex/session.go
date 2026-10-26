@@ -1,13 +1,17 @@
 package multiplex
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/metacubex/mihomo/common/pool"
 )
 
 const (
@@ -15,13 +19,27 @@ const (
 	frameData  byte = 0x02
 	frameClose byte = 0x03
 	frameReset byte = 0x04
+	framePing  byte = 0x05
+	framePong  byte = 0x06
 )
 
 const (
-	headerSize     = 1 + 4 + 4
-	maxFrameSize   = 256 * 1024
-	maxDataPayload = 32 * 1024
+	headerSize = 1 + 4 + 4
+	// maxQueuedBytesPerStream bounds unread payload retained by a single logical stream.
+	// A stream that exceeds the limit is reset so it cannot block the shared demux loop.
+	maxQueuedBytesPerStream = 4 * 1024 * 1024
+	maxFrameSize            = 256 * 1024
+	maxDataPayload          = 128 * 1024
+	keepaliveInterval       = 15 * time.Second
+
+	// Frames of at most coalesceMaxPayload bytes are queued and written together with the
+	// frames of other streams; larger ones are written directly behind the queue. A sender
+	// that finds coalesceMaxPending bytes queued waits for its turn to write.
+	coalesceMaxPayload = 4 * 1024
+	coalesceMaxPending = 64 * 1024
 )
+
+var errMuxReceiveQueueFull = errors.New("mux receive queue full")
 
 type acceptEvent struct {
 	stream  *stream
@@ -31,7 +49,11 @@ type acceptEvent struct {
 type Session struct {
 	conn net.Conn
 
+	// writeMu is held by whichever goroutine is writing to conn. Small frames wait in
+	// pending (guarded by pendMu) so that one write can carry the frames of several streams.
 	writeMu sync.Mutex
+	pendMu  sync.Mutex
+	pending *bytes.Buffer
 
 	streamsMu sync.Mutex
 	streams   map[uint32]*stream
@@ -42,6 +64,11 @@ type Session struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
+
+	// wroteSinceTick is set by sendFrame and consumed by the idle keepalive tick.
+	wroteSinceTick atomic.Bool
+	keepaliveOnce  sync.Once
+	pongPending    atomic.Bool
 }
 
 func NewClientSession(conn net.Conn) (*Session, error) {
@@ -54,6 +81,7 @@ func NewClientSession(conn net.Conn) (*Session, error) {
 		closed:  make(chan struct{}),
 	}
 	go s.readLoop()
+	s.startKeepalive(keepaliveInterval)
 	return s, nil
 }
 
@@ -68,6 +96,7 @@ func NewServerSession(conn net.Conn) (*Session, error) {
 		closed:   make(chan struct{}),
 	}
 	go s.readLoop()
+	s.startKeepalive(keepaliveInterval)
 	return s, nil
 }
 
@@ -81,6 +110,15 @@ func (s *Session) IsClosed() bool {
 	default:
 		return false
 	}
+}
+
+func (s *Session) Done() <-chan struct{} {
+	if s == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return s.closed
 }
 
 func (s *Session) closedErr() error {
@@ -115,6 +153,13 @@ func (s *Session) closeWithError(err error) {
 
 		close(s.closed)
 		_ = s.conn.Close()
+
+		s.pendMu.Lock()
+		if s.pending != nil {
+			pool.PutBuffer(s.pending)
+			s.pending = nil
+		}
+		s.pendMu.Unlock()
 	})
 }
 
@@ -165,19 +210,159 @@ func (s *Session) sendFrame(frameType byte, streamID uint32, payload []byte) err
 		return fmt.Errorf("mux payload too large: %d", len(payload))
 	}
 
-	var header [headerSize]byte
-	header[0] = frameType
-	binary.BigEndian.PutUint32(header[1:5], streamID)
-	binary.BigEndian.PutUint32(header[5:9], uint32(len(payload)))
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if err := writeAllChunks(s.conn, header[:], payload); err != nil {
-		s.closeWithError(err)
+	var err error
+	if len(payload) <= coalesceMaxPayload {
+		err = s.sendQueued(frameType, streamID, payload)
+	} else {
+		err = s.sendDirect(frameType, streamID, payload)
+	}
+	if err != nil {
 		return err
 	}
+	// Load first: the store only happens once per keepalive interval, so the hot path
+	// never writes the shared cache line.
+	if !s.wroteSinceTick.Load() {
+		s.wroteSinceTick.Store(true)
+	}
 	return nil
+}
+
+func putHeader(header []byte, frameType byte, streamID uint32, payloadLen int) {
+	header[0] = frameType
+	binary.BigEndian.PutUint32(header[1:5], streamID)
+	binary.BigEndian.PutUint32(header[5:9], uint32(payloadLen))
+}
+
+// sendQueued appends the frame to the pending batch, then writes the batch unless another
+// goroutine is already writing, which picks the frame up when it finishes its current write.
+func (s *Session) sendQueued(frameType byte, streamID uint32, payload []byte) error {
+	var header [headerSize]byte
+	putHeader(header[:], frameType, streamID, len(payload))
+
+	s.pendMu.Lock()
+	if s.pending == nil {
+		s.pending = pool.GetBuffer()
+	}
+	s.pending.Write(header[:])
+	s.pending.Write(payload)
+	full := s.pending.Len() >= coalesceMaxPending
+	s.pendMu.Unlock()
+	return s.flushPending(full)
+}
+
+// flushPending writes the pending batch. Unless wait is set it gives up when another
+// goroutine holds the write role; that goroutine rechecks the batch after each write, so
+// no frame is stranded.
+func (s *Session) flushPending(wait bool) error {
+	for {
+		if wait {
+			s.writeMu.Lock()
+		} else if !s.writeMu.TryLock() {
+			return nil
+		}
+		err := s.writeBatch(nil)
+		s.writeMu.Unlock()
+		if err != nil {
+			return err
+		}
+		wait = false
+
+		s.pendMu.Lock()
+		empty := s.pending == nil
+		s.pendMu.Unlock()
+		if empty {
+			return nil
+		}
+	}
+}
+
+// writeBatch writes the pending batch, followed by header when it is not nil, with one
+// write. writeMu must be held.
+func (s *Session) writeBatch(header []byte) error {
+	s.pendMu.Lock()
+	batch := s.pending
+	s.pending = nil
+	s.pendMu.Unlock()
+
+	var err error
+	switch {
+	case batch == nil && header == nil:
+		return nil
+	case batch == nil:
+		_, err = s.conn.Write(header)
+	default:
+		batch.Write(header)
+		_, err = s.conn.Write(batch.Bytes())
+		pool.PutBuffer(batch)
+	}
+	if err != nil {
+		s.closeWithError(err)
+	}
+	return err
+}
+
+// sendDirect writes a large frame behind any batch that is already pending, which keeps the
+// frames of a stream in order. The header travels with the batch; nothing can be queued in
+// front of the payload because writeMu is held until it is written.
+func (s *Session) sendDirect(frameType byte, streamID uint32, payload []byte) error {
+	var header [headerSize]byte
+	putHeader(header[:], frameType, streamID, len(payload))
+
+	s.writeMu.Lock()
+	err := s.writeBatch(header[:])
+	if err == nil {
+		if _, err = s.conn.Write(payload); err != nil {
+			s.closeWithError(err)
+		}
+	}
+	s.writeMu.Unlock()
+	if err != nil {
+		return err
+	}
+	// Frames queued while this one was being written still need a writer.
+	_ = s.flushPending(false)
+	return nil
+}
+
+// requestPong answers a ping off the read loop, which must not block on a write. Pings that
+// arrive while a pong is still waiting to be sent share it.
+func (s *Session) requestPong() {
+	if s.pongPending.Swap(true) {
+		return
+	}
+	go func() {
+		s.pongPending.Store(false)
+		_ = s.sendFrame(framePong, 0, nil)
+	}()
+}
+
+func (s *Session) startKeepalive(interval time.Duration) {
+	if s == nil || interval <= 0 {
+		return
+	}
+	s.keepaliveOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if s.wroteSinceTick.Swap(false) {
+						continue
+					}
+					// Stream zero is never allocated. v0.4.7 peers ignore DATA
+					// frames for unknown streams, so this remains compatible.
+					if err := s.sendFrame(frameData, 0, nil); err != nil {
+						return
+					}
+					// The keepalive itself is not traffic.
+					s.wroteSinceTick.Store(false)
+				case <-s.closed:
+					return
+				}
+			}
+		}()
+	})
 }
 
 func (s *Session) sendReset(streamID uint32, msg string) {
@@ -246,8 +431,20 @@ func (s *Session) readLoop() {
 				return
 			}
 		}
-
 		switch frameType {
+		case framePing:
+			if streamID != 0 || len(payload) != 0 {
+				s.closeWithError(errors.New("invalid mux ping frame"))
+				return
+			}
+			s.requestPong()
+
+		case framePong:
+			if streamID != 0 || len(payload) != 0 {
+				s.closeWithError(errors.New("invalid mux pong frame"))
+				return
+			}
+
 		case frameOpen:
 			if s.acceptCh == nil {
 				s.sendReset(streamID, "unexpected open")
@@ -280,15 +477,20 @@ func (s *Session) readLoop() {
 			if len(payload) == 0 {
 				continue
 			}
-			st.enqueue(payload)
+			if err := st.enqueue(payload); err != nil {
+				st.closeNoSend(err)
+				s.removeStream(streamID)
+				go s.sendReset(streamID, err.Error())
+			}
 
 		case frameClose:
 			st := s.getStream(streamID)
 			if st == nil {
 				continue
 			}
-			st.closeNoSend(io.EOF)
-			s.removeStream(streamID)
+			if st.closeRemoteWrite() {
+				s.removeStream(streamID)
+			}
 
 		case frameReset:
 			st := s.getStream(streamID)
@@ -338,41 +540,29 @@ type stream struct {
 	session *Session
 	id      uint32
 
-	mu       sync.Mutex
-	cond     *sync.Cond
-	closed   bool
-	closeErr error
-	readBuf  []byte
-	queue    [][]byte
+	writeMu sync.Mutex
 
-	localAddr  net.Addr
-	remoteAddr net.Addr
+	mu                sync.Mutex
+	cond              sync.Cond // cond.L is &mu.
+	closed            bool
+	localReadClosed   bool
+	localWriteClosed  bool
+	remoteWriteClosed bool
+	closeErr          error
+	readBuf           []byte
+	queue             [][]byte
+	// queuedBytes includes unread bytes in readBuf and queue.
+	queuedBytes int
 }
+
+// streamAddr is the placeholder address every stream reports; streams have no network
+// address of their own, and sharing one value saves two allocations per stream.
+var streamAddr net.Addr = &net.TCPAddr{}
 
 func newStream(session *Session, id uint32) *stream {
-	st := &stream{
-		session:    session,
-		id:         id,
-		localAddr:  &net.TCPAddr{},
-		remoteAddr: &net.TCPAddr{},
-	}
-	st.cond = sync.NewCond(&st.mu)
+	st := &stream{session: session, id: id}
+	st.cond.L = &st.mu
 	return st
-}
-
-func (c *stream) enqueue(payload []byte) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return
-	}
-	if len(c.readBuf) == 0 && len(c.queue) == 0 {
-		c.readBuf = payload
-	} else {
-		c.queue = append(c.queue, payload)
-	}
-	c.cond.Signal()
-	c.mu.Unlock()
 }
 
 func (c *stream) closeNoSend(err error) {
@@ -392,9 +582,27 @@ func (c *stream) closeNoSend(err error) {
 	c.mu.Unlock()
 }
 
+func (c *stream) closeRemoteWrite() bool {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return false
+	}
+	c.remoteWriteClosed = true
+	remove := c.localWriteClosed
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	return remove
+}
+
 func (c *stream) closedErr() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	err := c.closedErrLocked()
+	c.mu.Unlock()
+	return err
+}
+
+func (c *stream) closedErrLocked() error {
 	if c.closeErr == nil {
 		return io.ErrClosedPipe
 	}
@@ -408,22 +616,38 @@ func (c *stream) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for len(c.readBuf) == 0 && len(c.queue) == 0 && !c.closed {
+	for len(c.readBuf) == 0 && len(c.queue) == 0 && !c.closed && !c.localReadClosed && !c.remoteWriteClosed {
 		c.cond.Wait()
 	}
 	if len(c.readBuf) == 0 && len(c.queue) > 0 {
 		c.readBuf = c.queue[0]
+		c.queue[0] = nil
 		c.queue = c.queue[1:]
-	}
-	if len(c.readBuf) == 0 && c.closed {
-		if c.closeErr == nil {
-			return 0, io.ErrClosedPipe
+		if len(c.queue) == 0 {
+			c.queue = nil
 		}
-		return 0, c.closeErr
+	}
+	if len(c.readBuf) == 0 {
+		switch {
+		case c.closed:
+			return 0, c.closedErrLocked()
+		case c.localReadClosed:
+			return 0, io.ErrClosedPipe
+		case c.remoteWriteClosed:
+			return 0, io.EOF
+		}
 	}
 
 	n := copy(p, c.readBuf)
 	c.readBuf = c.readBuf[n:]
+	if len(c.readBuf) == 0 {
+		c.readBuf = nil
+	}
+	c.queuedBytes -= n
+	if c.queuedBytes < 0 {
+		c.queuedBytes = 0
+	}
+	c.cond.Broadcast()
 	return n, nil
 }
 
@@ -431,18 +655,25 @@ func (c *stream) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if c.session == nil || c.session.IsClosed() {
-		if c.session != nil {
-			return 0, c.session.closedErr()
-		}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	if c.session == nil {
 		return 0, io.ErrClosedPipe
+	}
+	if c.session.IsClosed() {
+		return 0, c.session.closedErr()
 	}
 
 	c.mu.Lock()
 	closed := c.closed
+	writeClosed := c.localWriteClosed
 	c.mu.Unlock()
 	if closed {
 		return 0, c.closedErr()
+	}
+	if writeClosed {
+		return 0, io.ErrClosedPipe
 	}
 
 	written := 0
@@ -461,28 +692,81 @@ func (c *stream) Write(p []byte) (int, error) {
 }
 
 func (c *stream) Close() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return nil
 	}
+	sendClose := !c.localWriteClosed
 	c.closed = true
+	c.localReadClosed = true
+	c.localWriteClosed = true
 	if c.closeErr == nil {
 		c.closeErr = io.ErrClosedPipe
 	}
+	c.readBuf = nil
+	c.queue = nil
+	c.queuedBytes = 0
 	c.cond.Broadcast()
 	c.mu.Unlock()
 
-	_ = c.session.sendFrame(frameClose, c.id, nil)
-	c.session.removeStream(c.id)
+	if c.session != nil {
+		if sendClose {
+			_ = c.session.sendFrame(frameClose, c.id, nil)
+		}
+		c.session.removeStream(c.id)
+	}
 	return nil
 }
 
-func (c *stream) CloseWrite() error { return c.Close() }
-func (c *stream) CloseRead() error  { return c.Close() }
+func (c *stream) CloseWrite() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
-func (c *stream) LocalAddr() net.Addr  { return c.localAddr }
-func (c *stream) RemoteAddr() net.Addr { return c.remoteAddr }
+	c.mu.Lock()
+	if c.closed || c.localWriteClosed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.localWriteClosed = true
+	remove := c.remoteWriteClosed || c.localReadClosed
+	c.mu.Unlock()
+
+	if c.session == nil {
+		return nil
+	}
+	err := c.session.sendFrame(frameClose, c.id, nil)
+	if remove {
+		c.session.removeStream(c.id)
+	}
+	return err
+}
+
+func (c *stream) CloseRead() error {
+	c.mu.Lock()
+	if c.closed || c.localReadClosed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.localReadClosed = true
+	c.readBuf = nil
+	c.queue = nil
+	c.queuedBytes = 0
+	remove := c.localWriteClosed
+	c.cond.Broadcast()
+	c.mu.Unlock()
+
+	if remove && c.session != nil {
+		c.session.removeStream(c.id)
+	}
+	return nil
+}
+
+func (c *stream) LocalAddr() net.Addr  { return streamAddr }
+func (c *stream) RemoteAddr() net.Addr { return streamAddr }
 
 func (c *stream) SetDeadline(t time.Time) error {
 	_ = c.SetReadDeadline(t)
@@ -491,3 +775,23 @@ func (c *stream) SetDeadline(t time.Time) error {
 }
 func (c *stream) SetReadDeadline(time.Time) error  { return nil }
 func (c *stream) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *stream) enqueue(payload []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed || c.localReadClosed || c.remoteWriteClosed {
+		return nil
+	}
+	if c.queuedBytes+len(payload) > maxQueuedBytesPerStream {
+		return errMuxReceiveQueueFull
+	}
+	c.queuedBytes += len(payload)
+	if len(c.readBuf) == 0 && len(c.queue) == 0 {
+		c.readBuf = payload
+	} else {
+		c.queue = append(c.queue, payload)
+	}
+	c.cond.Broadcast()
+	return nil
+}

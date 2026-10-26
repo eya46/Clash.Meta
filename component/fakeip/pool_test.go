@@ -36,7 +36,7 @@ func createCachefileStore(options Options) (*Pool, string, error) {
 		return nil, "", err
 	}
 
-	db, err := bbolt.Open(f.Name(), 0o666, &bbolt.Options{Timeout: time.Second})
+	db, err := bbolt.Open(f.Name(), 0o666, &bbolt.Options{Timeout: time.Second, NoStatistics: true})
 	if err != nil {
 		return nil, "", err
 	}
@@ -210,6 +210,33 @@ func TestPool_Clone(t *testing.T) {
 	_, lastExist := newPool.LookBack(last)
 	assert.True(t, firstExist)
 	assert.True(t, lastExist)
+}
+
+func TestPool_CloneKeepsAllocationState(t *testing.T) {
+	ipnet := netip.MustParsePrefix("192.168.0.1/24")
+	pool, _ := New(Options{
+		IPNet: ipnet,
+		Size:  10,
+	})
+
+	foo := pool.Lookup("foo.com")
+	bar := pool.Lookup("bar.com")
+
+	newPool, _ := New(Options{
+		IPNet: ipnet,
+		Size:  10,
+	})
+	newPool.CloneFrom(pool)
+
+	// a fresh allocation must not overwrite the retained mappings
+	baz := newPool.Lookup("baz.com")
+	assert.NotEqual(t, foo, baz)
+	assert.NotEqual(t, bar, baz)
+	assert.Equal(t, foo, newPool.Lookup("foo.com"))
+	assert.Equal(t, bar, newPool.Lookup("bar.com"))
+	host, ok := newPool.LookBack(foo)
+	assert.True(t, ok)
+	assert.Equal(t, "foo.com", host)
 }
 
 func TestPool_Error(t *testing.T) {
